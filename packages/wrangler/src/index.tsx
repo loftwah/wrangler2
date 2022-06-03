@@ -72,6 +72,7 @@ import type { TailCLIFilters } from "./tail";
 import type { RawData } from "ws";
 import type { CommandModule } from "yargs";
 import type Yargs from "yargs";
+import { watch } from "chokidar";
 
 type ConfigPath = string | undefined;
 
@@ -1035,7 +1036,23 @@ function createCLIParser(argv: string[]) {
       const configPath =
         (args.config as ConfigPath) ||
         (args.script && findWranglerToml(path.dirname(args.script)));
-      const config = readConfig(configPath, args);
+      let config = readConfig(configPath, args);
+
+      const resolvedConfigPath = configPath ?? config.configPath;
+      let watcher: ReturnType<typeof watch> | undefined;
+      if (resolvedConfigPath) {
+        watcher = watch(resolvedConfigPath, {
+          persistent: true,
+          ignoreInitial: true,
+        }).on("all", async (_event, filePath) => {
+          config = readConfig(configPath, args);
+          logger.log("EVENTS", _event, config.vars);
+          logger.log(`The file ${filePath} changed...`);
+
+          rerender(await devComponent(config));
+        });
+      }
+
       const entry = await getEntry(args, config, "dev");
 
       if (config.services && config.services.length > 0) {
@@ -1174,7 +1191,7 @@ function createCLIParser(argv: string[]) {
         );
       }
 
-      const bindings = {
+      const bindings = (configParam: Config) => ({
         kv_namespaces: config.kv_namespaces?.map(
           ({ binding, preview_id, id: _id }) => {
             // In `dev`, we make folks use a separate kv namespace called
@@ -1197,12 +1214,12 @@ function createCLIParser(argv: string[]) {
           }
         ),
         // Use a copy of combinedVars since we're modifying it later
-        vars: getVarsForDev(config),
-        wasm_modules: config.wasm_modules,
-        text_blobs: config.text_blobs,
-        data_blobs: config.data_blobs,
-        durable_objects: config.durable_objects,
-        r2_buckets: config.r2_buckets?.map(
+        vars: getVarsForDev(configParam),
+        wasm_modules: configParam.wasm_modules,
+        text_blobs: configParam.text_blobs,
+        data_blobs: configParam.data_blobs,
+        durable_objects: configParam.durable_objects,
+        r2_buckets: configParam.r2_buckets?.map(
           ({ binding, preview_bucket_name, bucket_name: _bucket_name }) => {
             // same idea as kv namespace preview id,
             // same copy-on-write TODO
@@ -1217,13 +1234,13 @@ function createCLIParser(argv: string[]) {
             };
           }
         ),
-        services: config.services,
-        unsafe: config.unsafe?.bindings,
-      };
+        services: configParam.services,
+        unsafe: configParam.unsafe?.bindings,
+      });
 
       // mask anything that was overridden in .dev.vars
       // so that we don't log potential secrets into the terminal
-      const maskedVars = { ...bindings.vars };
+      const maskedVars = { ...bindings(config).vars };
       for (const key of Object.keys(maskedVars)) {
         if (maskedVars[key] !== config.vars[key]) {
           // This means it was overridden in .dev.vars
@@ -1234,11 +1251,11 @@ function createCLIParser(argv: string[]) {
 
       // now log all available bindings into the terminal
       printBindings({
-        ...bindings,
+        ...bindings(config),
         vars: maskedVars,
       });
 
-      const { waitUntilExit } = render(
+      const devComponent = async (configParams: Config) => (
         <Dev
           name={getScriptName(args, config)}
           entry={entry}
@@ -1283,11 +1300,12 @@ function createCLIParser(argv: string[]) {
             args["compatibility-flags"] || config.compatibility_flags
           }
           usageModel={config.usage_model}
-          bindings={bindings}
+          bindings={bindings(configParams)}
           crons={config.triggers.crons}
         />
       );
-      await waitUntilExit();
+      const { waitUntilExit, rerender } = render(await devComponent(config));
+      await waitUntilExit().finally(() => watcher?.close());
     }
   );
 

@@ -1,6 +1,7 @@
 import { createServer as createHttpServer } from "node:http";
 import { connect } from "node:http2";
 import { createServer as createHttpsServer } from "node:https";
+import { execaSync } from "execa";
 import WebSocket from "faye-websocket";
 import { createHttpTerminator } from "http-terminator";
 import { useEffect, useRef, useState } from "react";
@@ -23,6 +24,15 @@ import type ws from "ws";
 interface IWebsocket extends ws {
   // Pipe implements .on("message", ...)
   pipe<T>(fn: T): IWebsocket;
+}
+
+function killPort(port = 8787) {
+  //TODO: Windows support to kill port
+  try {
+    return execaSync(`kill $(lsof -t -i :${port})`, { shell: true });
+  } catch (e) {
+    // I dont care if this fails right now
+  }
 }
 
 /**
@@ -90,6 +100,13 @@ export function usePreviewServer({
   /** Creates an HTTP/1 proxy that sends requests over HTTP/2. */
   const [proxy, setProxy] = useState<PreviewProxy>();
 
+  function proxyCleanup(proxyTarget: PreviewProxy) {
+    proxyTarget.server.close();
+    proxyTarget.server.addListener(
+      "close",
+      async () => await proxyTarget.terminator.terminate()
+    );
+  }
   /**
    * Create the instance of the local proxy server that will pass on
    * requests to the preview worker.
@@ -100,13 +117,21 @@ export function usePreviewServer({
         .then((server) => {
           setProxy({
             server,
-            terminator: createHttpTerminator({ server }),
+            terminator: createHttpTerminator({
+              server,
+              gracefulTerminationTimeout: 100,
+            }),
           });
         })
         .catch(async (err) => {
           logger.error("Failed to create proxy server:", err);
         });
     }
+    return () => {
+      if (proxy !== undefined) {
+        proxyCleanup(proxy);
+      }
+    };
   }, [proxy, localProtocol]);
 
   /**
@@ -330,7 +355,7 @@ export function usePreviewServer({
       abortController.abort();
       // Running `proxy.server.close()` does not close open connections, preventing the process from exiting.
       // So we use this `terminator` to close all the connections and force the server to shutdown.
-      proxy.terminator.terminate();
+      proxyCleanup(proxy);
     };
   }, [port, ip, proxy, localProtocol]);
 }
@@ -450,14 +475,19 @@ export async function waitForPortToBeAvailable(
       // trying to make a server listen on that port, and retrying
       // until it succeeds.
       const server = createHttpServer();
+      const terminator = createHttpTerminator({
+        server,
+      });
       server.on("error", (err) => {
         // @ts-expect-error non standard property on Error
         if (err.code !== "EADDRINUSE") {
           doReject(err);
         }
       });
-      server.listen(port, () => {
+      server.listen(port, async () => {
+        await terminator.terminate();
         server.close();
+
         doResolve();
       });
     }
