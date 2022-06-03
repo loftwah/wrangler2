@@ -1,7 +1,6 @@
 import { createServer as createHttpServer } from "node:http";
 import { connect } from "node:http2";
 import { createServer as createHttpsServer } from "node:https";
-import { execaSync } from "execa";
 import WebSocket from "faye-websocket";
 import { createHttpTerminator } from "http-terminator";
 import { useEffect, useRef, useState } from "react";
@@ -24,15 +23,6 @@ import type ws from "ws";
 interface IWebsocket extends ws {
   // Pipe implements .on("message", ...)
   pipe<T>(fn: T): IWebsocket;
-}
-
-function killPort(port = 8787) {
-  //TODO: Windows support to kill port
-  try {
-    return execaSync(`kill $(lsof -t -i :${port})`, { shell: true });
-  } catch (e) {
-    // I dont care if this fails right now
-  }
 }
 
 /**
@@ -84,6 +74,10 @@ type PreviewProxy = {
   terminator: HttpTerminator;
 };
 
+async function terminateProxy(target: PreviewProxy) {
+  await target.terminator.terminate();
+}
+
 export function usePreviewServer({
   previewToken,
   publicRoot,
@@ -100,13 +94,6 @@ export function usePreviewServer({
   /** Creates an HTTP/1 proxy that sends requests over HTTP/2. */
   const [proxy, setProxy] = useState<PreviewProxy>();
 
-  function proxyCleanup(proxyTarget: PreviewProxy) {
-    proxyTarget.server.close();
-    proxyTarget.server.addListener(
-      "close",
-      async () => await proxyTarget.terminator.terminate()
-    );
-  }
   /**
    * Create the instance of the local proxy server that will pass on
    * requests to the preview worker.
@@ -119,7 +106,7 @@ export function usePreviewServer({
             server,
             terminator: createHttpTerminator({
               server,
-              gracefulTerminationTimeout: 100,
+              gracefulTerminationTimeout: 0,
             }),
           });
         })
@@ -129,7 +116,7 @@ export function usePreviewServer({
     }
     return () => {
       if (proxy !== undefined) {
-        proxyCleanup(proxy);
+        terminateProxy(proxy).catch(() => {});
       }
     };
   }, [proxy, localProtocol]);
@@ -343,6 +330,7 @@ export function usePreviewServer({
         proxy.server.on("listening", () => {
           logger.log(`⬣ Listening at ${localProtocol}://${ip}:${port}`);
         });
+
         proxy.server.listen(port, ip);
       })
       .catch((err) => {
@@ -353,9 +341,7 @@ export function usePreviewServer({
 
     return () => {
       abortController.abort();
-      // Running `proxy.server.close()` does not close open connections, preventing the process from exiting.
-      // So we use this `terminator` to close all the connections and force the server to shutdown.
-      proxyCleanup(proxy);
+      terminateProxy(proxy).catch(() => {});
     };
   }, [port, ip, proxy, localProtocol]);
 }
@@ -445,13 +431,13 @@ export async function waitForPortToBeAvailable(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    options.abortSignal.addEventListener("abort", () => {
+    options.abortSignal.addEventListener("abort", async () => {
       const abortError = new Error("waitForPortToBeAvailable() aborted");
       (abortError as Error & { code: string }).code = "ABORT_ERR";
       doReject(abortError);
     });
 
-    const timeout = setTimeout(() => {
+    const timeout = setTimeout(async () => {
       doReject(new Error(`Timed out waiting for port ${port}`));
     }, options.timeout);
 
@@ -477,8 +463,10 @@ export async function waitForPortToBeAvailable(
       const server = createHttpServer();
       const terminator = createHttpTerminator({
         server,
+        gracefulTerminationTimeout: 0, // default 5000
       });
-      server.on("error", (err) => {
+
+      server.on("error", async (err) => {
         // @ts-expect-error non standard property on Error
         if (err.code !== "EADDRINUSE") {
           doReject(err);
@@ -486,8 +474,6 @@ export async function waitForPortToBeAvailable(
       });
       server.listen(port, async () => {
         await terminator.terminate();
-        server.close();
-
         doResolve();
       });
     }

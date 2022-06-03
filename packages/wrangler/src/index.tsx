@@ -4,6 +4,7 @@ import path from "node:path";
 import { setTimeout } from "node:timers/promises";
 import TOML from "@iarna/toml";
 import chalk from "chalk";
+import { watch } from "chokidar";
 import { execa } from "execa";
 import { findUp } from "find-up";
 import getPort from "get-port";
@@ -72,7 +73,6 @@ import type { TailCLIFilters } from "./tail";
 import type { RawData } from "ws";
 import type { CommandModule } from "yargs";
 import type Yargs from "yargs";
-import { watch } from "chokidar";
 
 type ConfigPath = string | undefined;
 
@@ -1255,6 +1255,18 @@ function createCLIParser(argv: string[]) {
         vars: maskedVars,
       });
 
+      function getPortFactory(defaultPort: number) {
+        let portValue: number;
+        return async () => {
+          return (
+            portValue || (portValue = await getPort({ port: defaultPort }))
+          );
+        };
+      }
+
+      const portGetter = getPortFactory(DEFAULT_LOCAL_PORT);
+      const inspectorPortGetter = getPortFactory(9229);
+
       const devComponent = async (configParams: Config) => (
         <Dev
           name={getScriptName(args, config)}
@@ -1282,14 +1294,10 @@ function createCLIParser(argv: string[]) {
             args.siteInclude,
             args.siteExclude
           )}
-          port={
-            args.port ||
-            config.dev.port ||
-            (await getPort({ port: DEFAULT_LOCAL_PORT }))
-          }
+          port={args.port || config.dev.port || (await portGetter())}
           ip={args.ip || config.dev.ip}
           inspectorPort={
-            args["inspector-port"] ?? (await getPort({ port: 9229 }))
+            args["inspector-port"] ?? (await inspectorPortGetter())
           }
           public={args["experimental-public"]}
           compatibilityDate={getDevCompatibilityDate(
@@ -1304,7 +1312,9 @@ function createCLIParser(argv: string[]) {
           crons={config.triggers.crons}
         />
       );
-      const { waitUntilExit, rerender } = render(await devComponent(config));
+      const { waitUntilExit, rerender, unmount } = render(
+        await devComponent(config)
+      );
       await waitUntilExit().finally(() => watcher?.close());
     }
   );
